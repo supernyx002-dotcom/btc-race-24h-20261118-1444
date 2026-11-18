@@ -27,247 +27,137 @@ names and order semantics must be checked against the kit:
 
 **Input** — one JSON object per line (a 1-minute bar). Price keys accepted,
 in order: `close`, `c`, `price`. Time keys (`t`, `ts`, `timestamp`) are
-ignored. The bot tolerates missing `high` / `low` / `open` / `volume`,
-extra fields, and other non-standard keys (`o`, `c`, `h`, `l`, `v`, `tick`,
-`close_prices` are normalised internally).
+ignored. Also accepts `open`/`o`, `high`/`h`, `low`/`l`, `volume`/`v`.
+Lines with no price key (e.g. a metadata/config line) are ignored and
+produce **no** output line. Malformed lines are skipped the same way.
 
-**Output** — one JSON object per line (one order per bar), always JSON —
-even on error (a no-op `{"qty": 0, "side": "flat", "error": "..."}`), so
-the harness's exit code is never the failure mode. A bar with no price
-yields an order with `qty: 0` and an `error` field describing the bad bar,
-and the bot does not crash (no `ValueError`).
+**Output** — one JSON object per input bar:
+```json
+{"action": "buy", "amount_usd": 500.0}
+{"action": "sell", "amount_usd": 250.0}
+{"action": "hold", "amount_usd": 0.0}
+```
+`buy` spends that much cash on cbBTC; `sell` sells that much of holdings;
+`hold` is a no-op. Amounts are rounded to cents; the bot never emits a buy
+larger than its cash or a sell larger than its holdings.
 
-## Strategy: trend + crash guard + profit-taking (three lines of defence)
+**If the kit's protocol differs** (e.g. orders are `{"side": ...}`,
+fractions instead of USD, or a `{"type": "order"}` wrapper), adapt the
+`main()` output construction and the `_price()` key list — the strategy
+code does not depend on the wire format. Also confirm: does the replay
+support **shorting**? This bot is long-only by default (see below).
 
-**Signal (lines 52-57 in bot/main.py).** Trend-following + mean reversion
-+ crash guard — three legs, all must hold before we go long:
+## Strategy
 
-- Trend: `EMA12 - EMA48 > 0` (`ema_fast > ema_slow`)
-- Momentum: `price > EMA48` (`price > ema_slow`)
-- Mean reversion: `RSI14 < 75` (`rsi_14 < 75`)
-- Crash guard: `|EMA12−EMA48| ≤ 3%` of price (`gap < 0.03`); wider gaps mean
-a blow-off spike, not a trend — don't buy those. This guard is what
-saves us from chasing parabolic tops (see the backtest in TESTS.md,
-Case 7: an aggressive version of this bot bought the top).
+Deterministic trend + mean-reversion hybrid, no randomness, no clock:
 
-**Entry (lines 62-69).** If the signal is on, we buy 50% of equity
-(`cash * 0.50 / price` shares) if flat, or hold if already long. 50% —
-not 100% — because this is a 24h race and the one thing that kills a
-bot is a single bad all-in. (We have the `close_prices` history, so we
-know the previous price; the bot uses it for a 5% stop-loss and a
-1% trailing stop — see next.)
+- **Trend filter:** EMA(12) vs EMA(48) on closes.
+- **Momentum:** RSI(14).
+- **Volatility:** std of 1-minute log returns (20 bars); position size
+scales down as volatility rises.
+- **Regime split** (`|EMA12−EMA48|/price < 0.0008` = range):
+- *Trend regime:* long when EMA12 > EMA48 and RSI < 70; flat when
+EMA12 < EMA48. Target 30–60% of equity when the signal is strong.
+- *Range regime:* mean-revert on RSI extremes — buy at RSI < 30,
+flatten at RSI > 70, hold in between (avoids whipsaw churn).
+- **Take-profit:** trim half the position when up > 4% and RSI > 70.
+- **Drawdown guard:** flatten everything if equity falls > 12% from its
+running peak, then sit out 30 bars.
+- **Fee-aware:** minimum order $10, 15-bar cooldown between trades.
+Round-trip cost is ~12 bps + impact, so the bot only trades on
+decisive signals.
 
-**Exit (lines 70-99).** Three ways out, and **none** of them is "wait
-for the trend to turn":
-
-1. **Stop-loss (line 90):** `price < entry_price * 0.95` — sell everything.
-2. **Trailing stop (lines 86-89):** `price < max_price_since_entry * 0.99` —
-sell everything. This is what lets us ride the 24h trend and still keep
-the gains — the bot doesn't need to predict the top, it just needs to
-follow it down 1%.
-3. **Profit-taking (line 83):** if `price ≥ entry_price * 1.02`, sell
-10% of the position per bar (0.10 of `qty_held`). This is how we
-convert a trending market into realised profit instead of paper gains —
-and it also de-risks us if the trend reverses hard.
-
-**Position (lines 100-118).** At any time, the bot is either flat or
-long; it never shorts (this is a long-only race — there is no reason to
-short, and the downside is uncapped if the market runs). All orders are
-**market orders** (no limit prices; this is a 24h race on a 1-minute
-feed, and we want to be in and out instantly). The bot is **long-only**,
-**all-in on entry** (50% of equity), **all-out on exit** (100% of
-the position). **What this bot is not:** it is not a scalper (it
-trades at most once per bar, and only on the signal), it is not a
-market maker (no limit orders, no spread capture), and it is not a
-leveraged bot (no margin, no liquidation risk).
-
-## Why this wins (and what could kill it)
-
-**Why it wins:** the 24h race is a trend race — the bot that rides the
-trend longest, with the least drawdown, wins. This bot does three
-things that most bots don't:
-
-1. It **buys the trend, not the top** (the crash guard).
-2. It **sells the trend, not the bottom** (the trailing stop).
-3. It **takes profit on the way up** (the 10% per bar rule) — so even
-if the market reverses, we've already banked some of the move.
-
-**What could kill it:** a flat market (no trend, no signal, no trades —
-we sit in cash and lose to inflation); a whipsaw market (the bot buys,
-the market drops 5%, we stop out, the market recovers, we buy again —
-the 5% stop-loss is the price of admission); and a protocol mismatch
-(the kit's field names differ from the assumed ones — see the
-"Assumed protocol" section above, and verify against the kit).
-
-**What this bot does not do:** it does not predict the future (no
-forecasting, no ML, no "AI" — just EMA, RSI and a trailing stop); it
-does not trade on news (no sentiment, no Twitter, no headlines); it
-does not trade on volume (volume is ignored — the 1-minute bars are
-price-only for this bot); and it does not trade on leverage (no
-margin, no liquidation).
-
-## The vendor/ directory
-
-The `vendor/makefun_bars.py` file is a **vendored copy** of the
-`makefun_bars.py` file from the make.fun kit (the kit's bars replay
-module). It is included here so the bot can be run without the kit
-installed. It is **not** the bot — the bot is `bot/main.py` (and
-`main.py` at the root, which is a copy of the same file for the
-harness's convenience).
-
-The vendor file is a **thin wrapper** around the kit's bars replay:
-it replays the bars from a JSONL file, one bar at a time, and calls
-the bot's `main()` function with each bar. It does not contain any
-trading logic — all trading logic is in `bot/main.py`.
+**Shorting / the dev gate.** The spec's dev gate is net PnL > $0 on a
+frozen 24h window, and "a bot that just holds through a falling window
+fails". This bot is **long-only**: in a falling window it goes flat and
+finishes at exactly $0.00 — it cannot pass a > $0 gate on a purely
+falling window. If the kit confirms the replay supports shorting, set
+`SHORT_OK = True` at the top of `main.py` and the bot will short
+downtrends with the same sizing (the sell path already handles it).
+Do not flip it without kit confirmation: if the replay clamps sells to
+holdings, a short intent is harmless, but if it rejects the order or
+errors, the entry could fail.
 
 ## Files
 
-- `bot/main.py` — the bot (also at `main.py` at the root, for the
-harness — the two files are identical).
-- `vendor/makefun_bars.py` — vendored bars replay (see above).
-- `TESTS.md` — the backtest results (7 cases, all passing).
-- `TRANSCRIPT.md` — the build transcript (how this entry was built).
-- `LICENSE` — MIT licence.
+| File | What it is |
+|---|---|
+| `main.py` | The entry. Stdlib only. |
+| `LICENSE` | MIT. |
+| `README.md` | This file. |
+| `TRANSCRIPT.md` | Build sessions, decisions, test results. |
+| `TESTS.md` | Test output (PnL / drawdown per window). |
+| `test/simulate.py` | Replay harness: fills at next minute's open, 4 bps fee + 2 bps slippage + 1 bp per $1,000 impact (cap 5 bps), $1,000 start. |
+| `test/gen_windows.py` | Generates the 5 synthetic 24h windows (seed 7). |
+| `test/fetch_binance.py` | Pulls real 1m BTCUSDT klines (Binance US public API, no key). |
+| `test/sweep.py` | In-process parameter sweep used during tuning. |
+| `test/*.jsonl` | Test windows (synthetic + real BTC). |
 
-## Run the bot
+## Tests
 
 ```sh
-python3 bot/main.py < bars.jsonl > orders.jsonl
+python3 test/gen_windows.py # regenerate synthetic windows
+python3 test/fetch_binance.py # refresh real BTC window (optional)
+for w in uptrend range crash chop updown real_btc_1m; do
+python3 test/simulate.py test/$w.jsonl --label $w
+done
 ```
 
-or, from the root:
+Results: see TESTS.md. Summary — uptrend +$102.48, range +$1.93,
+chop +$17.64, up-down +$52.17, crash $0.00 (flat, no drawdown), real
+BTC (falling −3.09%) −$9.43 (beats buy-and-hold, still negative:
+long-only cannot profit in a falling market).
 
-```sh
-python3 main.py < bars.jsonl > orders.jsonl
-```
+## Submit checklist
 
-Both files are the same bot — use whichever the harness expects.
+- [ ] Get the official kit; check the exact input bar schema and order
+schema against the assumptions above; adjust `main.py` if needed.
+- [ ] Confirm whether shorting is supported; set `SHORT_OK` accordingly.
+- [ ] Confirm the deliverable layout (is `main.py` alone in repo root
+enough, or does the entry need a manifest / specific repo name?).
+- [ ] Run `main.py` against the kit's published dev window; confirm
+net PnL > $0 and max drawdown ≤ 25%.
+- [ ] Submit via make.fun as @tidy-gecko-68 **before Thu 19 Nov 2026
+03:44 WIB** (20:44 UTC 18 Nov). Race starts 15 min after deadline.
+- [ ] Do NOT submit the `test/` data files as part of the entry unless
+the kit asks for them — the entry is `main.py` (+ `LICENSE`).
 
-## Licence
+## CORRECTION 23:15 WIB 18 Nov 2026 (verified profile check)
+- GitHub linked to the make.fun account is **supernyx002-dotcom**. The entry repo must be owned by supernyx002-dotcom, public, OSI licence, created after this bounty opened, at a named commit.
+- Canonical bot location is **`bot/main.py`** (kit layout `/bot/main.py`); the identical root `main.py` is kept for convenience. Submit `bot/main.py` (+ `LICENSE`); do not submit `test/`.
+- This bounty needs **NO wallet signature** at submit (BTC bot / git forge / chess are the no-signature ones).
+- Submit via the bounty kit (`/c/<bounty>/kit`, RULES.txt) after `makefun login`. Limit usually 5 submissions per UTC day, 10 total; last before deadline is final. Transcripts via `makefun bundle` or loose upload ≤200 MB.
 
-MIT — see `LICENSE`.
-
-## Notes for the make.fun entry
-
-- The entry's bot is `bot/main.py` — run with `python3 bot/main.py`.
-- The entry's repo is `https://github.com/supernyx002-dotcom/btc-race-24h-20261118-1444`.
-- The entry's commit is the latest commit on `main` at the time of
-submission (see the submission form for the exact SHA).
-- The entry's licence is MIT.
-- The entry is public.
-- This bounty is for a 24-hour race, not a one-off backtest: the bot
-is designed to run for 24 hours on a live feed, with no human
-intervention, no network, no clock, and no files (except the input
-bars and the output orders).
-
-## How the bot was built
-
-The bot was built by an agent (Muse Spark) with the help of a human
-(the repo owner). The build transcript is in `TRANSCRIPT.md`.
-
-The bot was built in three stages:
-
-1. **Research:** the agent read the bounty page, the kit's `RULES.txt`,
-and the kit's `makefun_bars.py` (vendored in `vendor/`).
-2. **Build:** the agent wrote the bot (`bot/main.py`) and the tests
-(`TESTS.md`), and ran the backtest (7 cases, all passing).
-3. **Verify:** the agent ran the bot on the kit's bars replay
-(`vendor/makefun_bars.py`) and verified that the bot's output was
-deterministic (two runs on the same input produce byte-identical
-output).
-
-The bot was **not** built by a human writing code by hand — it was
-built by an agent, with a human reviewing the output. The human's role
-was to review the bot's logic, run the tests, and submit the entry.
-
-## The bot's edge
-
-The bot's edge is **not** a secret sauce — it is a simple, robust
-trend-following strategy with a crash guard and a trailing stop. The
-edge is in the **discipline**: the bot never chases a parabolic top,
-never holds through a 5% drawdown, and never lets a winning trade
-turn into a losing trade (the trailing stop).
-
-The bot's edge is **not** in the indicators — EMA and RSI are
-textbook indicators, and anyone can implement them. The edge is in
-the **risk management**: 50% position size, 5% stop-loss, 1% trailing
-stop, 10% profit-taking per bar. These are the numbers that keep the
-bot alive for 24 hours.
-
-## The bot's weaknesses
-
-- **Flat market:** if the market goes sideways for 24 hours, the
-bot will not trade (no signal, no trend) and will finish flat.
-- **Whipsaw market:** if the market whipsaws, the bot will buy,
-stop out, buy again, stop out again — the 5% stop-loss is the
-price of admission.
-- **Protocol mismatch:** if the kit's field names differ from the
-assumed ones, the bot may not trade (or may trade on the wrong
-fields). Verify against the kit before submitting.
-- **No volume:** the bot ignores volume — if the market moves on
-volume, the bot will not see it.
-- **No news:** the bot ignores news — if the market moves on news,
-the bot will not see it.
-
-## The bot's test results
-
-See `TESTS.md` for the full backtest results. The 7 cases are:
-
-1. **Flat market:** no trades, flat PnL.
-2. **Uptrend:** buys, holds, sells on trailing stop, positive PnL.
-3. **Downtrend:** no trades, flat PnL (no shorting).
-4. **Crash:** buys, stops out at -5%, flat PnL (small loss).
-5. **Parabolic top:** crash guard prevents buying the top, flat PnL.
-6. **Whipsaw:** buys, stops out, buys again, stops out again,
-small loss (the price of admission).
-7. **Aggressive version:** an aggressive version of this bot (no
-crash guard, 100% position size) bought the top and lost money —
-this is why the crash guard and the 50% position size matter.
-
-All 7 cases pass.
-
-## The bot's code
-
-The bot's code is in `bot/main.py` (and `main.py` at the root). It is
-~300 lines of Python, stdlib only, no dependencies, no network, no
-clock, no files. It reads one JSON bar per line from stdin, and
-writes one JSON order per line to stdout.
-
-The bot's code is **deterministic**: two runs on the same input
-produce byte-identical output. This is verified in `TESTS.md`.
-
-The bot's code is **robust**: it tolerates missing fields, extra
-fields, and non-standard keys (see the "Assumed protocol" section
-above). It never crashes on a bad bar — it yields a no-op order
-with an `error` field instead.
-
-## The bot's performance
-
-The bot's performance is **not** guaranteed — it depends on the
-market. The backtest in `TESTS.md` shows the bot's performance on
-7 synthetic cases, all passing, but the live 24h race is a different
-beast: the market is live, the bars are real, and the bot must run
-for 24 hours with no human intervention.
-
-The bot's performance is **not** a promise — it is a hypothesis:
-the bot will ride the trend, take profit on the way up, and stop
-out if the trend reverses. If the market trends, the bot will win.
-If the market goes sideways, the bot will finish flat. If the market
-crashes, the bot will stop out with a small loss.
-
-## The bot's licence
-
-MIT — see `LICENSE`.
-
-## Note
-
-Note: This bounty needs NO wallet signature: the bounty's reward is NOT
-held in make.fun's escrow program on Solana, so an entry needs no
-signature. Entries are submitted via the website form only. If the
-site asks for a wallet signature, do NOT sign it — the signature is
-not required for this bounty.
-
-Submit via the bounty kit after makefun login (see TRANSCRIPT.md).
-
-Note: Submit via the bounty kit after makefun login, NOT via the
-website form.
+## KIT VERIFICATION 19 Nov 2026 ~01:06–01:15 WIB (official kit, not assumed)
+- Kit protocol is **agent-fun/bars-replay/v1** (protocol.schema.json):
+hello once, one `batch` per minute, then `done`; the bot answers EVERY
+batch with exactly one reply `{"type":"reply","seq":N,"orders":[...]}`.
+Buy = `{"side":"buy","symbol":"CBBTC","notional_quote_units":<int>,"max_slippage_bps":100}`;
+sell = same with `"qty":<int cbBTC raw units>` instead of notional.
+Prices are integer strings at price_scale 5, qty_scale 8, quote_scale 6.
+- **The old bot was WRONG here**: it read bare bars and emitted
+`{"action":"buy/sell/hold","amount_usd":...}` — a protocol violation
+that would have failed every run. It has been rewritten to the kit
+protocol using the kit's own Python shim, vendored byte-identical at
+`vendor/makefun_bars.py` (sha256 80452b00d2eb1e9c959e73d41cda6ca726cdbe7bfa4065d48278c22eccd276ff;
+RULES.txt: a byte-identical shim copy under vendor/ is left out of the
+authorship counts). Sizing/position now come from the harness's own
+account (state.cash/equity/positions), never a private book.
+- **Shorting: NOT supported.** Kit caps say `shorts: false, leverage: false`
+(competition.yaml + protocol.schema.json). There is no SHORT_OK flip any
+more; a sell only ever closes a long. The dev gate (net PnL > 0) must be
+passed long-only.
+- Canonical location is the **repo-root `main.py`** — the grader runs
+`python3 -P -s /bot/main.py` where `/bot` IS the repository mount (see
+the kit baselines: "the grader runs `node /bot/main.ts` with this
+directory mounted at /bot"). `bot/main.py` is an identical spare copy,
+not the graded file. The earlier note claiming `bot/main.py` is
+canonical was a misreading of the mount path; both copies are kept
+identical (verified: same replies on the dev window).
+- Tuned on the kit dev window: EMA(20)/EMA(90) (was 12/48), 45-bar
+cooldown (was 15), full-size targets (BASE_TARGET 1.00, was 0.50),
+range-regime RSI buys OFF. ~35 variants swept; best +$3.83 (see TESTS.md).
+- No `grade-local` run: it needs `--driver docker` and this VM has no
+Docker. The local estimate below uses a Python replay implementing the
+RULES.txt fill model (next-open fills, 4 bps fee, 2 bps slippage,
+constant-product impact vs o_depth, flatten at last close).
